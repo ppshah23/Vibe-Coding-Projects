@@ -59,6 +59,8 @@ The most telling indicator is the 17.47% cache miss rate (89,456 misses out of 5
 
 === Chart saved to /mnt/c/Users/Prach/Documents/Interview Projects/agents/outputs/metrics_line.png ===
 
+=== Flame graph saved to /mnt/c/Users/Prach/Documents/Interview Projects/agents/outputs/flamegraph.png ===
+
 
 ## Graphs
 
