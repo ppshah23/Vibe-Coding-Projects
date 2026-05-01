@@ -1,11 +1,16 @@
 """
 Minimal LangGraph agent for systems performance analysis.
-Graph: extract_metrics -> summarize_bottlenecks
+Graph: extract_metrics -> summarize_bottlenecks -> visualize_metrics -> generate_flamegraph
 """
 
 import os
 import re
 from typing import TypedDict
+
+import matplotlib
+
+matplotlib.use("Agg")  # non-interactive backend — must be set before importing pyplot
+import matplotlib.pyplot as plt
 
 import anthropic
 from langgraph.graph import StateGraph, END
@@ -16,9 +21,12 @@ from langgraph.graph import StateGraph, END
 
 
 class PerfState(TypedDict):
-    raw_perf_output: str  # input: raw `perf stat` text
-    metrics: dict  # populated by node 1
-    summary: str  # populated by node 2
+    raw_perf_output: str       # input: raw `perf stat` text
+    perf_script_output: str    # input: simulated `perf script` stack traces
+    metrics: dict              # populated by node 1
+    summary: str               # populated by node 2
+    chart_path: str            # populated by node 3
+    flamegraph_path: str       # populated by node 4
 
 
 # ---------------------------------------------------------------------------
@@ -166,21 +174,183 @@ def summarize_bottlenecks(state: PerfState) -> PerfState:
         response = client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=300,
-            messages=[{
-                "role": "user",
-                "content": (
-                    "You are a systems performance engineer. Given these perf stat metrics, "
-                    "identify the primary bottleneck and explain it in one concise paragraph. "
-                    "Be specific about the numbers.\n\n"
-                    f"Metrics:\n{metrics_text}"
-                ),
-            }],
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "You are a systems performance engineer. Given these perf stat metrics, "
+                        "identify the primary bottleneck and explain it in one concise paragraph. "
+                        "Be specific about the numbers.\n\n"
+                        f"Metrics:\n{metrics_text}"
+                    ),
+                }
+            ],
         )
         summary = response.content[0].text.strip()
     else:
         summary = rule_based_summary
 
     return {**state, "summary": summary}
+
+
+# ---------------------------------------------------------------------------
+# Node 3 — visualize extracted metrics as a line plot
+# ---------------------------------------------------------------------------
+
+# Healthy thresholds for the three derived ratios.
+# IPC: higher is better (threshold is the minimum acceptable value).
+# Miss rates: lower is better (threshold is the maximum acceptable value).
+_THRESHOLDS = {
+    "IPC": ("ipc", 1.0, "higher is better"),
+    "Cache Miss Rate": ("cache_miss_rate", 0.10, "lower is better"),
+    "Branch Miss Rate": ("branch_miss_rate", 0.02, "lower is better"),
+}
+
+
+def visualize_metrics(state: PerfState) -> PerfState:
+    """Save a line plot of the three key derived ratios to outputs/metrics_line.png."""
+    metrics = state["metrics"]
+
+    labels, values, thresholds = [], [], []
+    for display_name, (key, threshold, _) in _THRESHOLDS.items():
+        if key in metrics:
+            labels.append(display_name)
+            values.append(metrics[key])
+            thresholds.append(threshold)
+
+    if not labels:
+        return {**state, "chart_path": ""}
+
+    outputs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
+    os.makedirs(outputs_dir, exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+
+    ax.plot(
+        labels, values, marker="o", linewidth=2, color="steelblue", label="Measured"
+    )
+    ax.plot(
+        labels,
+        thresholds,
+        marker="x",
+        linewidth=1.5,
+        linestyle="--",
+        color="crimson",
+        label="Threshold",
+    )
+
+    # Annotate each measured point with its numeric value
+    for x, y in zip(labels, values):
+        ax.annotate(
+            f"{y:.3f}",
+            xy=(x, y),
+            xytext=(0, 8),
+            textcoords="offset points",
+            ha="center",
+            fontsize=9,
+        )
+
+    ax.set_title("Perf Stat Key Metrics vs Thresholds")
+    ax.set_ylabel("Value")
+    ax.set_xlabel("Metric")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    chart_path = os.path.join(outputs_dir, "metrics_line.png")
+    fig.savefig(chart_path)
+    plt.close(fig)
+
+    return {**state, "chart_path": chart_path}
+
+
+# ---------------------------------------------------------------------------
+# Node 4 — parse perf script stack traces and render a flame graph
+# ---------------------------------------------------------------------------
+
+
+def _parse_perf_script(text: str) -> list:
+    """Return list of stacks in root→leaf order from perf script output."""
+    stacks, current = [], []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if current:
+                stacks.append(list(reversed(current)))
+                current = []
+        elif line.startswith(("\t", " ")):
+            parts = stripped.split(None, 1)
+            current.append(parts[1] if len(parts) > 1 else parts[0])
+    if current:
+        stacks.append(list(reversed(current)))
+    return stacks
+
+
+def _build_tree(stacks: list) -> dict:
+    root = {"name": "all", "count": 0, "children": {}}
+    for stack in stacks:
+        root["count"] += 1
+        node = root
+        for frame in stack:
+            if frame not in node["children"]:
+                node["children"][frame] = {"name": frame, "count": 0, "children": {}}
+            node = node["children"][frame]
+            node["count"] += 1
+    return root
+
+
+def _layout(node: dict, x: float = 0.0, depth: int = 0) -> list:
+    """DFS traversal; returns [(name, x, count, depth), ...]."""
+    result = [(node["name"], x, node["count"], depth)]
+    child_x = x
+    for child in node["children"].values():
+        result.extend(_layout(child, child_x, depth + 1))
+        child_x += child["count"]
+    return result
+
+
+def generate_flamegraph(state: PerfState) -> PerfState:
+    """Render a flame graph from perf script stack traces to outputs/flamegraph.png."""
+    text = state["perf_script_output"]
+    if not text.strip():
+        return {**state, "flamegraph_path": ""}
+
+    stacks = _parse_perf_script(text)
+    root = _build_tree(stacks)
+    entries = _layout(root)
+    total = root["count"]
+    max_depth = max(d for _, _, _, d in entries)
+
+    fig, ax = plt.subplots(figsize=(12, max(4, (max_depth + 1) * 0.7)))
+    cmap = plt.cm.YlOrRd
+
+    for name, x, count, depth in entries:
+        w = count / total
+        color = cmap(0.2 + 0.6 * depth / max(max_depth, 1))
+        ax.broken_barh(
+            [(x / total, w)], (depth, 0.85),
+            facecolors=[color], edgecolors="white", linewidth=0.5,
+        )
+        if w > 0.04:
+            ax.text(
+                x / total + w / 2, depth + 0.425, name,
+                ha="center", va="center", fontsize=7, clip_on=True,
+            )
+
+    ax.set_xlim(0, 1)
+    ax.set_ylim(-0.1, max_depth + 1)
+    ax.set_xlabel("Fraction of Samples")
+    ax.set_title("Flame Graph — perf script (simulated)")
+    ax.set_yticks([])
+    fig.tight_layout()
+
+    outputs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
+    os.makedirs(outputs_dir, exist_ok=True)
+    flamegraph_path = os.path.join(outputs_dir, "flamegraph.png")
+    fig.savefig(flamegraph_path, dpi=150)
+    plt.close(fig)
+
+    return {**state, "flamegraph_path": flamegraph_path}
 
 
 # ---------------------------------------------------------------------------
@@ -193,11 +363,15 @@ def build_graph() -> StateGraph:
 
     graph.add_node("extract_metrics", extract_metrics)
     graph.add_node("summarize_bottlenecks", summarize_bottlenecks)
+    graph.add_node("visualize_metrics", visualize_metrics)
+    graph.add_node("generate_flamegraph", generate_flamegraph)
 
-    # Linear flow: extract -> summarize -> end
+    # Linear flow: extract -> summarize -> visualize -> flamegraph -> end
     graph.set_entry_point("extract_metrics")
     graph.add_edge("extract_metrics", "summarize_bottlenecks")
-    graph.add_edge("summarize_bottlenecks", END)
+    graph.add_edge("summarize_bottlenecks", "visualize_metrics")
+    graph.add_edge("visualize_metrics", "generate_flamegraph")
+    graph.add_edge("generate_flamegraph", END)
 
     return graph.compile()
 
@@ -223,10 +397,44 @@ SAMPLE_PERF_OUTPUT = """
        0.002851754 seconds time elapsed
 """
 
+# Compact representation of realistic `ls -la` call stacks (root → leaf, count).
+# Mirrors what `perf record -g | perf script` would produce for listing a large directory.
+_FLAME_STACKS = [
+    (["_start", "__libc_start_main", "main", "print_long_format", "lstat64"], 15),
+    (["_start", "__libc_start_main", "main", "print_dir", "getdents64"], 10),
+    (["_start", "__libc_start_main", "main", "print_long_format", "vfprintf", "write"], 8),
+    (["_start", "__libc_start_main", "main", "xmalloc", "malloc"], 5),
+    (["_start", "__libc_start_main", "main", "opendir"], 2),
+]
+
+
+def _make_perf_script(stacks: list) -> str:
+    """Serialize compact stack definitions into perf script text format."""
+    lines = []
+    ts = 0.001
+    for stack, count in stacks:
+        for _ in range(count):
+            lines.append(f"ls 1234 [000] {ts:.3f}: cycles:")
+            for frame in reversed(stack):  # perf script lists leaf first
+                lines.append(f"\t55b000 {frame}")
+            lines.append("")
+            ts += 0.001
+    return "\n".join(lines)
+
+
+SAMPLE_PERF_SCRIPT = _make_perf_script(_FLAME_STACKS)
+
 if __name__ == "__main__":
     app = build_graph()
     result = app.invoke(
-        {"raw_perf_output": SAMPLE_PERF_OUTPUT, "metrics": {}, "summary": ""}
+        {
+            "raw_perf_output": SAMPLE_PERF_OUTPUT,
+            "perf_script_output": SAMPLE_PERF_SCRIPT,
+            "metrics": {},
+            "summary": "",
+            "chart_path": "",
+            "flamegraph_path": "",
+        }
     )
 
     print("=== Extracted Metrics ===")
@@ -235,3 +443,9 @@ if __name__ == "__main__":
 
     print("\n=== Bottleneck Summary ===")
     print(result["summary"])
+
+    if result["chart_path"]:
+        print(f"\n=== Chart saved to {result['chart_path']} ===")
+
+    if result["flamegraph_path"]:
+        print(f"\n=== Flame graph saved to {result['flamegraph_path']} ===")
